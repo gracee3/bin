@@ -55,6 +55,7 @@ Core options (sanitize):
 
 PDF options (only relevant with --pdf):
       --pdf-outdir DIR       Where raw extracted txt goes (default: txt)
+      --pdf-src PATTERN      Glob pattern of input PDFs (default: *.pdf)
       --pdf-mode raw|layout  pdftotext mode (default: raw)
       --pdf-force            Force reconversion even if output is up-to-date
       --pdf-min-chars N      Flag PDFs with output under N chars as OCR candidates (default: 200)
@@ -109,6 +110,7 @@ PDF_OUTDIR="txt"
 PDF_FORCE=0
 PDF_MIN_CHARS=200
 PDF_MODE="raw"
+PDF_SRC="*.pdf"
 
 # Bundle defaults (mirrors bundle-llm-corpus.sh behavior)
 BUNDLE_OUT="corpus.txt"
@@ -185,6 +187,9 @@ while (( $# )); do
     --pdf-outdir)
       [[ $# -ge 2 ]] || { echo "Missing argument for --pdf-outdir" >&2; exit 2; }
       PDF_OUTDIR="$2"; shift 2 ;;
+    --pdf-src)
+      [[ $# -ge 2 ]] || { echo "Missing argument for --pdf-src" >&2; exit 2; }
+      PDF_SRC="$2"; shift 2 ;;
     --pdf-mode)
       [[ $# -ge 2 ]] || { echo "Missing argument for --pdf-mode" >&2; exit 2; }
       PDF_MODE="$2"; shift 2 ;;
@@ -510,8 +515,15 @@ pdf_to_txt() {
   local converted=0 skipped_uptodate=0 flagged_ocr=0 failed=0
   local -a flagged_files=()
 
-  # Build PDF list (null-delimited for safety)
-  mapfile -d '' pdfs < <(find . -maxdepth 1 -type f -name '*.pdf' -print0)
+  # Build PDF list (null-delimited for safety).
+  # If the pattern includes '/', use -wholename (because -name matches basenames only).
+  if [[ "$PDF_SRC" == *"/"* ]]; then
+    local wholename="$PDF_SRC"
+    [[ "$wholename" == ./* ]] || wholename="./$wholename"
+    mapfile -d '' pdfs < <(find . -type f -wholename "$wholename" -print0)
+  else
+    mapfile -d '' pdfs < <(find . -maxdepth 1 -type f -name "$PDF_SRC" -print0)
+  fi
 
   if (( ${#pdfs[@]} == 0 )); then
     echo "No PDFs found."
@@ -530,7 +542,7 @@ pdf_to_txt() {
 
   # Run in parallel, collect statuses
   mapfile -t results < <(
-    printf "%s\0" "${pdfs[@]}" | xargs -0 -r -P "$JOBS" bash -c 'pdf_to_txt_worker "$1"' _
+    printf "%s\0" "${pdfs[@]}" | xargs -0 -r -n 1 -P "$JOBS" bash -c 'pdf_to_txt_worker "$1"' _
   )
 
   for r in "${results[@]}"; do
@@ -765,7 +777,7 @@ sanitize_files() {
 
   # Run one file per worker
   mapfile -t results < <(
-    printf "%s\0" "${files[@]}" | xargs -0 -r -P "$sanitize_jobs" bash -c 'sanitize_one_file "$1"' _
+    printf "%s\0" "${files[@]}" | xargs -0 -r -n 1 -P "$sanitize_jobs" bash -c 'sanitize_one_file "$1"' _
   )
 
   scanned=${#files[@]}
