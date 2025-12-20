@@ -41,6 +41,7 @@ Core options (sanitize):
   -n, --dry-run              Do not modify files (default)
   -e, --ext EXT              When no files are specified, include extension EXT (repeatable). Default: txt
   -g, --glob PATTERN         When no files are specified, process files matching glob (overrides --ext)
+  -j, --jobs N               Parallel workers for PDF and sanitize (default: 4)
       --max-bytes N          Skip files larger than N bytes (default: 52428800 = 50 MiB)
       --allow-large          Do not skip large files
   -t, --tabstop N            Expand tabs to N spaces (default: 4)
@@ -81,6 +82,8 @@ EOF
 # ----------------------------
 # Defaults
 # ----------------------------
+JOBS=4
+
 MODE_PDF=0
 MODE_BUNDLE=0
 
@@ -139,6 +142,12 @@ while (( $# )); do
     -g|--glob)
       [[ $# -ge 2 ]] || { echo "Missing argument for --glob" >&2; exit 2; }
       GLOB="$2"
+      shift 2
+      ;;
+
+    -j|--jobs)
+      [[ $# -ge 2 ]] || { echo "Missing argument for --jobs" >&2; exit 2; }
+      JOBS="$2"
       shift 2
       ;;
 
@@ -217,7 +226,15 @@ while (( $# )); do POSITIONAL+=("$1"); shift; done
 [[ "$TABSTOP" =~ ^[0-9]+$ ]] || { echo "--tabstop must be an integer" >&2; exit 2; }
 [[ "$MAX_BYTES" =~ ^[0-9]+$ ]] || { echo "--max-bytes must be an integer" >&2; exit 2; }
 [[ "$PDF_MIN_CHARS" =~ ^[0-9]+$ ]] || { echo "--pdf-min-chars must be an integer" >&2; exit 2; }
+[[ "$JOBS" =~ ^[0-9]+$ ]] || { echo "--jobs must be an integer" >&2; exit 2; }
+(( JOBS >= 1 )) || { echo "--jobs must be >= 1" >&2; exit 2; }
+need xargs
 case "$PDF_MODE" in raw|layout) : ;; *) echo "Invalid --pdf-mode: $PDF_MODE (raw|layout)" >&2; exit 2;; esac
+: "${PDF_OUTDIR:=txt}"
+[[ -n "$PDF_OUTDIR" ]] || { echo "PDF_OUTDIR is empty" >&2; exit 2; }
+if (( REPORT_ENABLED )); then
+  echo "Warning: --report is currently not implemented in the parallel sanitizer path." >&2
+fi
 
 # Tools (baseline)
 need perl
@@ -294,8 +311,6 @@ $s =~ s/\x{2265}/\\ge{}/g;     # ≥
 # - plain underscores: _____
 # - LaTeX-escaped underscores might appear after escaping, but we do this early too
 $s =~ s/_{5,}/[BLANK]/g;
-# After escaping specials, collapse repeated \_ sequences too
-$s =~ s/(?:\\_){5,}/[BLANK]/g;
 
 # Escape LaTeX specials (do NOT touch backslash)
 $s =~ s/&/\\&/g;
@@ -305,6 +320,9 @@ $s =~ s/#/\\#/g;
 $s =~ s/_/\\_/g;
 $s =~ s/\{/\\{/g;
 $s =~ s/\}/\\}/g;
+
+# After escaping specials, collapse repeated \_ sequences too
+$s =~ s/(?:\\_){5,}/[BLANK]/g;
 
 # HARD GUARANTEE: remove remaining non-ASCII
 $s =~ s/[^\x00-\x7F]//g;
@@ -390,6 +408,7 @@ CMD
 
   bash -c "$cmd" -- "$in" "$out"
 }
+export -f sanitize_and_convert_to_tmp
 
 # ----------------------------
 # File selection helper
@@ -425,16 +444,36 @@ collect_txt_files() {
 }
 
 # ----------------------------
-# PDF conversion (pdf2llmtext behavior)
+# PDF conversion
 # ----------------------------
-pdf_to_txt() {
-  # Emits txt files into $PDF_OUTDIR. In dry-run, prints intended actions only.
-  need pdftotext
-  need pdfinfo
-  mkdir -p -- "$PDF_OUTDIR"
+pdf_to_txt_worker() {
+  local pdf="$1"
 
-  local converted=0 skipped_uptodate=0 flagged_ocr=0 failed=0
-  local -a flagged_files=()
+  local base="${pdf##*/}"
+  base="${base%.pdf}"
+  local out="${PDF_OUTDIR}/${base}.txt"
+
+  if (( ! PDF_FORCE )) && [[ -f "$out" && -s "$out" && "$out" -nt "$pdf" ]]; then
+    local existing_chars
+    existing_chars="$(LC_ALL=C wc -c < "$out" | tr -d ' ')"
+    if [[ "$existing_chars" -lt "$PDF_MIN_CHARS" ]]; then
+      echo "__SKIP_OCR__:$pdf"
+    else
+      echo "__SKIP__:$pdf"
+    fi
+    return 0
+  fi
+
+  local pages
+  pages="$(pdfinfo "$pdf" 2>/dev/null | awk -F: '/^Pages/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+  if [[ -z "${pages:-}" || ! "$pages" =~ ^[0-9]+$ ]]; then
+    echo "__FAIL__:$pdf"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  : > "$tmp"
 
   local -a pdftotext_args_common=(-enc UTF-8 -eol unix -nopgbrk)
   local -a pdftotext_args_mode=()
@@ -443,68 +482,80 @@ pdf_to_txt() {
     layout) pdftotext_args_mode=(-layout) ;;
   esac
 
-  for pdf in *.pdf; do
-    [[ -f "$pdf" ]] || continue
-
-    local base="${pdf##*/}"
-    base="${base%.pdf}"
-    local out="${PDF_OUTDIR}/${base}.txt"
-
-    if (( ! WRITE_MODE )); then
-      # Dry-run: just announce
-      echo "[DRY-RUN] would convert: $pdf -> $out"
-      continue
-    fi
-
-    # Up-to-date check
-    if (( ! PDF_FORCE )) && [[ -f "$out" && "$out" -nt "$pdf" ]]; then
-      skipped_uptodate=$((skipped_uptodate + 1))
-      continue
-    fi
-
-    local pages
-    pages="$(pdfinfo "$pdf" 2>/dev/null | awk -F: '/^Pages/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
-    if [[ -z "${pages:-}" || ! "$pages" =~ ^[0-9]+$ ]]; then
-      echo "Failed to read page count: $pdf" >&2
-      failed=$((failed + 1))
-      continue
-    fi
-
-    local tmp
-    tmp="$(mktemp)"
-    : > "$tmp"
-
-    for ((p=1; p<=pages; p++)); do
-      {
-        printf "\n\n===== FILE: %s | PAGE: %d/%d =====\n\n" "$pdf" "$p" "$pages"
-        pdftotext "${pdftotext_args_common[@]}" "${pdftotext_args_mode[@]}" -f "$p" -l "$p" -- "$pdf" - 2>/dev/null || true
-      } >> "$tmp"
-    done
-
-    local chars
-    chars="$(LC_ALL=C wc -c < "$tmp" | tr -d ' ')"
-    if [[ "$chars" -lt "$PDF_MIN_CHARS" ]]; then
-      flagged_ocr=$((flagged_ocr + 1))
-      flagged_files+=("$pdf")
-    fi
-
-    mv -- "$tmp" "$out"
-    converted=$((converted + 1))
+  for ((p=1; p<=pages; p++)); do
+    {
+      printf "\n\n===== FILE: %s | PAGE: %d/%d =====\n\n" "$pdf" "$p" "$pages"
+      pdftotext "${pdftotext_args_common[@]}" "${pdftotext_args_mode[@]}" -f "$p" -l "$p" -- "$pdf" - 2>/dev/null || true
+    } >> "$tmp"
   done
 
-  if (( WRITE_MODE )); then
-    echo "PDF2TXT Mode: ${PDF_MODE}"
-    echo "PDF2TXT Output dir: ${PDF_OUTDIR}"
-    echo "PDF2TXT Converted: ${converted}"
-    echo "PDF2TXT Skipped (up-to-date): ${skipped_uptodate}"
-    echo "PDF2TXT Flagged (likely needs OCR): ${flagged_ocr}"
-    echo "PDF2TXT Failed: ${failed}"
-    if (( flagged_ocr > 0 )); then
-      echo "PDF2TXT OCR candidates: $(IFS=,; echo "${flagged_files[*]}")"
-      echo "Tip: if scanned PDFs, run OCR first (e.g., ocrmypdf) then reconvert."
-    fi
+  local chars
+  chars="$(LC_ALL=C wc -c < "$tmp" | tr -d ' ')"
+
+  mv -- "$tmp" "$out"
+
+  if [[ "$chars" -lt "$PDF_MIN_CHARS" ]]; then
+    echo "__OCR__:$pdf"
+  else
+    echo "__OK__:$pdf"
   fi
 }
+export -f pdf_to_txt_worker
+
+pdf_to_txt() {
+  need pdftotext
+  need pdfinfo
+  mkdir -p -- "$PDF_OUTDIR"
+
+  local converted=0 skipped_uptodate=0 flagged_ocr=0 failed=0
+  local -a flagged_files=()
+
+  # Build PDF list (null-delimited for safety)
+  mapfile -d '' pdfs < <(find . -maxdepth 1 -type f -name '*.pdf' -print0)
+
+  if (( ${#pdfs[@]} == 0 )); then
+    echo "No PDFs found."
+    return 0
+  fi
+
+  if (( ! WRITE_MODE )); then
+    for pdf in "${pdfs[@]}"; do
+      base="${pdf##*/}"; base="${base%.pdf}"
+      echo "[DRY-RUN] would convert: $pdf -> ${PDF_OUTDIR}/${base}.txt"
+    done
+    return 0
+  fi
+
+  export PDF_OUTDIR PDF_FORCE PDF_MIN_CHARS PDF_MODE
+
+  # Run in parallel, collect statuses
+  mapfile -t results < <(
+    printf "%s\0" "${pdfs[@]}" | xargs -0 -r -P "$JOBS" bash -c 'pdf_to_txt_worker "$1"' _
+  )
+
+  for r in "${results[@]}"; do
+    case "$r" in
+      __OK__:* )   converted=$((converted + 1)) ;;
+      __OCR__:* )  converted=$((converted + 1)); flagged_ocr=$((flagged_ocr + 1)); flagged_files+=("${r#__OCR__:}") ;;
+      __SKIP__:* ) skipped_uptodate=$((skipped_uptodate + 1)) ;;
+      __SKIP_OCR__:* ) skipped_uptodate=$((skipped_uptodate + 1)); flagged_ocr=$((flagged_ocr + 1)); flagged_files+=("${r#__SKIP_OCR__:}") ;;
+      __FAIL__:* ) failed=$((failed + 1)) ;;
+    esac
+  done
+
+  echo "PDF2TXT Mode: ${PDF_MODE}"
+  echo "PDF2TXT Output dir: ${PDF_OUTDIR}"
+  echo "PDF2TXT Jobs: ${JOBS}"
+  echo "PDF2TXT Converted: ${converted}"
+  echo "PDF2TXT Skipped (up-to-date): ${skipped_uptodate}"
+  echo "PDF2TXT Flagged (likely needs OCR): ${flagged_ocr}"
+  echo "PDF2TXT Failed: ${failed}"
+  if (( flagged_ocr > 0 )); then
+    echo "PDF2TXT OCR candidates: $(IFS=,; echo "${flagged_files[*]}")"
+    echo "Tip: if scanned PDFs, run OCR first (e.g., ocrmypdf) then reconvert."
+  fi
+}
+
 
 # ----------------------------
 # Bundling (bundle-llm-corpus behavior)
@@ -528,16 +579,15 @@ bundle_corpus() {
   out_base="$(basename -- "$out")"
 
   # Collect files.
-  # If the pattern includes a '/', use -wholename (because -name matches basenames only).
+  # If the pattern includes '/', use -wholename (because -name matches basenames only).
   if [[ "$glob" == *"/"* ]]; then
-    # Normalize: allow user to pass txt/*.txt or ./txt/*.txt
     local wholename="$glob"
     [[ "$wholename" == ./* ]] || wholename="./$wholename"
 
     mapfile -d '' files < <(
       find . -type f \
         -wholename "$wholename" \
-        ! -wholename "./$out_base" \
+        ! -name "$out_base" \
         -print0
     )
   else
@@ -649,6 +699,52 @@ EOF
 # ----------------------------
 # Main sanitize runner
 # ----------------------------
+
+sanitize_one_file() {
+  local f="${1:-}"
+
+  [[ -n "$f" ]] || return 0
+  [[ -f "$f" ]] || return 0
+  
+  # Text/binary heuristic
+  if ! grep -Iq . "$f"; then
+    printf "__BIN__\t%s\n" "$f"
+    return 0
+  fi
+
+  local size_bytes
+  size_bytes=$(LC_ALL=C wc -c < "$f" | tr -d ' ')
+  if (( ! ALLOW_LARGE )) && [[ "$size_bytes" -gt "$MAX_BYTES" ]]; then
+    printf "__LARGE__\t%s\n" "$f"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  sanitize_and_convert_to_tmp "$f" "$tmp"
+
+  local after_bytes
+  after_bytes=$(LC_ALL=C wc -c < "$tmp" | tr -d ' ')
+
+  if cmp -s -- "$f" "$tmp"; then
+    rm -f -- "$tmp"
+    printf "__UNCHANGED__\t%s\t%s\t%s\n" "$f" "$size_bytes" "$after_bytes"
+
+    return 0
+  fi
+
+  if (( WRITE_MODE )); then
+    mv -- "$tmp" "$f"
+  else
+    rm -f -- "$tmp"
+  fi
+
+  printf "__CHANGED__\t%s\t%s\t%s\n" "$f" "$size_bytes" "$after_bytes"
+
+}
+export -f sanitize_one_file
+
+
 sanitize_files() {
   local -a files=()
   collect_txt_files files
@@ -658,79 +754,50 @@ sanitize_files() {
   local -a modified_files=()
   local -a flagged_files=()
 
-  for f in "${files[@]}"; do
-    scanned=$((scanned + 1))
+  # If unicode reporting is enabled, force single-thread sanitize to keep the report deterministic.
+  local sanitize_jobs="$JOBS"
+  if (( REPORT_ENABLED && JOBS > 1 )); then
+    echo "Note: unicode reporting enabled; forcing sanitize to single-threaded for deterministic report." >&2
+    sanitize_jobs=1
+  fi
 
-    # Text/binary heuristic
-    if ! grep -Iq . "$f"; then
-      skipped_binary=$((skipped_binary + 1))
-      continue
-    fi
+  export ALLOW_LARGE MAX_BYTES WRITE_MODE TRIM_TRAILING COLLAPSE_BLANKS EXPAND_TABS TABSTOP perl_script
 
-    size_bytes=$(LC_ALL=C wc -c < "$f" | tr -d ' ')
-    if (( ! ALLOW_LARGE )) && [[ "$size_bytes" -gt "$MAX_BYTES" ]]; then
-      skipped_large=$((skipped_large + 1))
-      continue
-    fi
+  # Run one file per worker
+  mapfile -t results < <(
+    printf "%s\0" "${files[@]}" | xargs -0 -r -P "$sanitize_jobs" bash -c 'sanitize_one_file "$1"' _
+  )
 
-    tmp="$(mktemp)"
-    sanitize_and_convert_to_tmp "$f" "$tmp"
+  scanned=${#files[@]}
 
-    # Unicode report: check pre-removal (base sanitation only) before final ASCII purge.
-    if (( REPORT_ENABLED )); then
-      tmp_report="$(mktemp)"
-      base_cmd=$(
-        cat <<'CMD'
-LC_ALL=C perl -0777 -pe '
-  s/\r\n?/\n/g;
-  s/\e\[[0-?]*[ -\/]*[@-~]//g;
-  s/\e\][^\a]*(?:\a|\e\\)//g;
-  s/\x{FEFF}//g;
-  s/[\x{200B}\x{200C}\x{200D}]//g;
-  s/[\x{202A}-\x{202E}\x{2066}-\x{2069}]//g;
-  1 while s/.\x08//g;
-' "$1" \
-| LC_ALL=C tr -d '\000-\010\013-\037\177'
-CMD
-      )
-      if (( TRIM_TRAILING )); then base_cmd+=" | sed -E 's/[ \t]+$//'"; fi
-      if (( COLLAPSE_BLANKS )); then base_cmd+=" | LC_ALL=C perl -0777 -pe 's/\n{3,}/\n\n/g; s/\A\n+//; s/\n*\z/\n/;'"; fi
-      if (( EXPAND_TABS )); then base_cmd+=" | expand -t ${TABSTOP}"; fi
-      base_cmd+=" > \"\$2\""
-      bash -c "$base_cmd" -- "$f" "$tmp_report"
-
-      out_report="$(flag_non_ascii "$tmp_report" "$f" || true)"
-      if [[ -n "$out_report" ]]; then
-        flagged_files+=("$f")
-        printf "%s\n" "$out_report" >> "$REPORT_FILE"
-      fi
-      rm -f -- "$tmp_report"
-    fi
-
-    after_bytes=$(LC_ALL=C wc -c < "$tmp" | tr -d ' ')
-
-    if cmp -s -- "$f" "$tmp"; then
-      unchanged=$((unchanged + 1))
-      rm -f -- "$tmp"
-      continue
-    fi
-
-    changed=$((changed + 1))
-    modified_files+=("$f")
-
-    delta=$((after_bytes - size_bytes))
-    net_delta_total=$((net_delta_total + delta))
-    if (( after_bytes <= size_bytes )); then
-      bytes_removed_total=$((bytes_removed_total + (size_bytes - after_bytes)))
-    else
-      bytes_added_total=$((bytes_added_total + (after_bytes - size_bytes)))
-    fi
-
-    if (( WRITE_MODE )); then
-      mv -- "$tmp" "$f"
-    else
-      rm -f -- "$tmp"
-    fi
+  for r in "${results[@]}"; do
+    case "$r" in
+      __BIN__* )   skipped_binary=$((skipped_binary + 1)) ;;
+      __LARGE__* ) skipped_large=$((skipped_large + 1)) ;;
+      __UNCHANGED__* )
+        unchanged=$((unchanged + 1))
+        IFS=$'\t' read -r tag file before after <<<"$r"
+        delta=$((after - before))
+        net_delta_total=$((net_delta_total + delta))
+        if (( after <= before )); then
+          bytes_removed_total=$((bytes_removed_total + (before - after)))
+        else
+          bytes_added_total=$((bytes_added_total + (after - before)))
+        fi
+        ;;
+      __CHANGED__* )
+        changed=$((changed + 1))
+        IFS=$'\t' read -r tag file before after <<<"$r"
+        modified_files+=("$file")
+        delta=$((after - before))
+        net_delta_total=$((net_delta_total + delta))
+        if (( after <= before )); then
+          bytes_removed_total=$((bytes_removed_total + (before - after)))
+        else
+          bytes_added_total=$((bytes_added_total + (after - before)))
+        fi
+        ;;
+    esac
   done
 
   if (( QUIET )); then
