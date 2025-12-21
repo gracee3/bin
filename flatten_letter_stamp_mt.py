@@ -31,9 +31,11 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 # ---------------- Configuration (env overrides) ----------------
+DEFAULT_STAMP_LABEL_TEMPLATE = "{stem} - Page {page_num} of {page_total}"
 DPI = int(os.environ.get("DPI", "200"))  # 150 smaller, 200 balanced, 300 higher fidelity
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", str(os.cpu_count() or 4)))
 SKIP_EXISTING = os.environ.get("SKIP_EXISTING", "1") == "1"
+STAMP_LABEL_TEMPLATE = os.environ.get("STAMP_LABEL_TEMPLATE")
 
 LETTER_W_IN = 8.5
 LETTER_H_IN = 11.0
@@ -65,6 +67,26 @@ def load_font(size_px: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
+def format_stamp_label(
+    template: str,
+    stem: str,
+    page_num: int,
+    page_total: int,
+) -> str:
+    """Render a stamp string from the template using available placeholders."""
+    if not template:
+        return f"Page {page_num} of {page_total}"
+    try:
+        label = template.format(stem=stem, page_num=page_num, page_total=page_total)
+    except Exception:
+        label = (
+            template.replace("{stem}", stem)
+            .replace("{page_num}", str(page_num))
+            .replace("{page_total}", str(page_total))
+        )
+    return label.strip() or f"Page {page_num} of {page_total}"
+
+
 def fit_to_letter_and_stamp(
     img: Image.Image,
     page_num: int,
@@ -72,6 +94,7 @@ def fit_to_letter_and_stamp(
     font: ImageFont.ImageFont,
     margin_bottom_px: int,
     no_upscale: bool = False,
+    label: str = "",
 ) -> Image.Image:
     """
     Convert to grayscale, fit within Letter canvas, and stamp page number.
@@ -95,12 +118,17 @@ def fit_to_letter_and_stamp(
     canvas.paste(resized, (x, y))
 
     draw = ImageDraw.Draw(canvas)
-    label = str(page_num)
-    bbox = draw.textbbox((0, 0), label, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    text = label or str(page_num)
+    if hasattr(draw, "textbbox"):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+    else:
+        tw, th = draw.textsize(text, font=font)
+
     tx = (W - tw) // 2
     ty = max(0, H - margin_bottom_px - th)
-    draw.text((tx, ty), label, font=font, fill=0)
+    draw.text((tx, ty), text, font=font, fill=0)
 
     return canvas
 
@@ -161,6 +189,11 @@ def process_pdf(pdf_path: str) -> None:
 
     font = load_font(PN_FONT_SIZE_PX)
     no_upscale = os.environ.get("NO_UPSCALE", "0") == "1"
+    label_template = STAMP_LABEL_TEMPLATE
+    if label_template is not None:
+        label_template = label_template.strip()
+    if not label_template:
+        label_template = DEFAULT_STAMP_LABEL_TEMPLATE
 
     # Render pages concurrently
     rendered: List[Image.Image] = [None] * n_pages  # type: ignore[assignment]
@@ -179,8 +212,9 @@ def process_pdf(pdf_path: str) -> None:
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, n_pages)) as ex:
         futs = []
         for i, img in enumerate(rendered, start=1):
+            label_text = format_stamp_label(label_template, stem, i, n_pages)
             futs.append(ex.submit(
-                fit_to_letter_and_stamp, img, i, DPI, font, PN_MARGIN_BOTTOM_PX, no_upscale
+                fit_to_letter_and_stamp, img, i, DPI, font, PN_MARGIN_BOTTOM_PX, no_upscale, label_text
             ))
         for i, fut in enumerate(as_completed(futs), start=0):
             pass  # just drain to surface exceptions
@@ -188,8 +222,9 @@ def process_pdf(pdf_path: str) -> None:
         # Because as_completed returns out of order, run a simple ordered pass:
         # (processing is fast; this also avoids holding a mapping)
     for i in range(n_pages):
+        label_text = format_stamp_label(label_template, stem, i + 1, n_pages)
         processed[i] = fit_to_letter_and_stamp(
-            rendered[i], i + 1, DPI, font, PN_MARGIN_BOTTOM_PX, no_upscale
+            rendered[i], i + 1, DPI, font, PN_MARGIN_BOTTOM_PX, no_upscale, label_text
         )
 
     # Assemble to PDF (Pillow)
