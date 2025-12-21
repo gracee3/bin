@@ -1,30 +1,20 @@
 #!/usr/bin/env python3
 """
-redline_diff.py
+redline_txt_diff.py
 
-Create a court-friendly redline (HTML, optionally PDF) from two versions of a complaint.
+Create an inline, court-friendly redline HTML from two TXT versions of a complaint.
 
-Default: TXT inputs (recommended for LaTeX-generated text).
-Optional: PDF inputs (extracted to text via PyMuPDF).
-
-Key features:
-- Normalization tuned for pleadings / LaTeX-ish exports
-- Anchor-based chunking (Roman numeral headings + numbered paragraphs) to avoid "all deletes then all adds"
-- Inline semantic diff (diff-match-patch) so unchanged text is plain; edits are localized
-- HTML output with red strikethrough deletions and blue underlined insertions
-- Optional HTML -> PDF via WeasyPrint
+- Normalizes LaTeX-ish text (drops page markers, drops repeating 5AC footer, normalizes TeX punctuation)
+- Anchor-based chunking (Roman numeral headings + numbered paragraphs)
+- Aligns chunks in document order to avoid "all red then all blue"
+- Inline semantic diff (diff-match-patch): unchanged text plain; deletions red strike; insertions blue underline
+- Outputs HTML (no PDF support in this version)
 
 Dependencies:
   pip install diff-match-patch
-Optional:
-  pip install weasyprint
-  pip install pymupdf
 
-Usage (TXT default):
-  python redline_diff.py old.txt new.txt --out_html redline.html --out_pdf redline.pdf
-
-Usage (PDF):
-  python redline_diff.py old.pdf new.pdf --pdf --out_html redline.html --out_pdf redline.pdf
+Usage:
+  python redline_txt_diff.py 5ac.txt 6ac.txt --out_html redline.html --keep_txt
 """
 
 from __future__ import annotations
@@ -33,122 +23,89 @@ import argparse
 import html
 import re
 import unicodedata
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Tuple
 
+from difflib import SequenceMatcher
 from diff_match_patch import diff_match_patch
 
 
 # -------------------------
-# Input handling
+# Input
 # -------------------------
 
 def read_text_file(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def extract_text_from_pdf(pdf_path: Path) -> str:
-    """
-    Extract text using PyMuPDF. Works best for text-based PDFs.
-    """
-    try:
-        import fitz  # PyMuPDF
-    except ImportError as e:
-        raise SystemExit("Missing dependency: pymupdf. Install with: pip install pymupdf") from e
-
-    doc = fitz.open(str(pdf_path))
-    chunks: List[str] = []
-    for i in range(len(doc)):
-        page = doc.load_page(i)
-        chunks.append(page.get_text("text"))
-    doc.close()
-    return "\n".join(chunks)
-
-
-def load_input(path: Path, force_pdf: bool = False) -> str:
-    if force_pdf or path.suffix.lower() == ".pdf":
-        return extract_text_from_pdf(path)
-    return read_text_file(path)
-
-
 # -------------------------
-# Normalization
+# Normalization (targeted to your 5ac/6ac artifacts)
 # -------------------------
 
-@dataclass
-class NormalizeOptions:
-    # Remove simple "Page X of Y" markers
-    drop_page_markers: bool = True
-    # Normalize unicode (stabilize characters)
-    normalize_unicode: bool = True
-    # Normalize TeX-style quotes/dashes
-    normalize_tex_punct: bool = True
-    # Dehyphenate line-broken words
-    dehyphenate: bool = True
-    # Collapse extra spaces
-    collapse_spaces: bool = True
-    # Normalize blank lines to at most one empty line between blocks
-    normalize_blank_lines: bool = True
+# Matches "Page 1 of 77" / "Page 80 of 80" etc
+RE_PAGE_OF = re.compile(r"^\s*Page\s+\d+\s+of\s+\d+\s*$", re.IGNORECASE | re.MULTILINE)
 
+# Matches the repeating footer/caption line in 5ac that starts with "Clark v."
+# (tolerates hyphen variants and spacing differences)
+RE_CLARK_FOOTER = re.compile(
+    r"(?im)^\s*Clark\s+v\.\s+District\s+of\s+Columbia.*Complaint\s*$"
+)
 
-_PAGE_OF_RE = re.compile(r"^\s*Page\s+\d+\s+of\s+\d+\s*$", re.IGNORECASE | re.MULTILINE)
-
-
-def normalize_latexish_text(s: str, opt: NormalizeOptions) -> str:
+def normalize_latexish_text(s: str) -> str:
     """
-    Normalization tuned for LaTeX-generated or pleading-like text exports.
-    Keeps structure while reducing non-material differences that break anchoring.
+    Normalization tuned for LaTeX-ish complaint exports:
+    - Remove page markers "Page X of Y"
+    - Remove repeating 5AC footer "Clark v. District of Columbia ... Complaint"
+    - Normalize TeX quotes/dashes
+    - Dehyphenate line-break hyphenation
+    - Collapse extraneous whitespace / blank lines
     """
-    if opt.normalize_unicode:
-        s = unicodedata.normalize("NFKC", s)
-
+    s = unicodedata.normalize("NFKC", s)
     s = s.replace("\r\n", "\n").replace("\r", "\n")
 
-    if opt.drop_page_markers:
-        s = _PAGE_OF_RE.sub("", s)
+    # Drop page markers
+    s = RE_PAGE_OF.sub("", s)
 
-    if opt.normalize_tex_punct:
-        # TeX quotes -> plain quotes
-        s = s.replace("``", '"').replace("''", '"')
-        # Normalize common dash conventions consistently
-        # (Pick characters that print well in HTML/PDF; also improves diff stability.)
-        s = s.replace("---", "—").replace("--", "–")
+    # Drop repeating 5ac footer/caption
+    s = RE_CLARK_FOOTER.sub("", s)
 
-    if opt.dehyphenate:
-        # "inter-\nnational" -> "international"
-        s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)
+    # Normalize TeX quotes to straight quotes
+    s = s.replace("``", '"').replace("''", '"')
 
-    if opt.collapse_spaces:
-        s = s.replace("\u00A0", " ")
-        s = re.sub(r"[ \t]+", " ", s)
-        s = re.sub(r"[ \t]+\n", "\n", s)
+    # Normalize TeX dash conventions consistently
+    s = s.replace("---", "—").replace("--", "–")
 
-    if opt.normalize_blank_lines:
-        s = re.sub(r"\n\s*\n\s*\n+", "\n\n", s)
+    # Dehyphenate words split across line breaks
+    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)
+
+    # Collapse horizontal whitespace
+    s = s.replace("\u00A0", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"[ \t]+\n", "\n", s)
+
+    # Normalize blank lines
+    s = re.sub(r"\n\s*\n\s*\n+", "\n\n", s)
 
     return s.strip()
 
 
 # -------------------------
-# Anchor chunking
+# Anchor chunking + alignment (for interleaved red/blue output)
 # -------------------------
 
 ANCHOR_RE = re.compile(
     r"""
-    (?m)                               # multiline
-    ^\s*[IVXLCDM]+\.\s+.+$             # Roman numeral heading like "I. INTRODUCTION"
+    (?m)
+    ^\s*[IVXLCDM]+\.\s+.+$    # Roman numeral heading like "I. INTRODUCTION"
     |
-    ^\s*\d+\.\s+                       # numbered paragraph like "23. "
+    ^\s*\d+\.\s+              # numbered paragraph like "23. "
     """,
     re.VERBOSE
 )
 
-
 def split_by_anchors(text: str) -> List[Tuple[str, str]]:
     """
-    Returns a list of (anchor, chunk_text) where anchor is the first line of the chunk.
-    This provides stable alignment even when the body of the paragraph changes.
+    Returns list of (anchor, chunk_text) where anchor is the first line of the chunk.
     """
     matches = list(ANCHOR_RE.finditer(text))
     if not matches:
@@ -164,17 +121,73 @@ def split_by_anchors(text: str) -> List[Tuple[str, str]]:
     return chunks
 
 
+def align_chunks(
+    old_chunks: List[Tuple[str, str]],
+    new_chunks: List[Tuple[str, str]],
+    similarity_threshold: float = 0.35,
+) -> List[Tuple[Optional[Tuple[str, str]], Optional[Tuple[str, str]]]]:
+    """
+    Align chunks in document order to produce interleaved (old?, new?) pairs.
+    This avoids dumping all deletes then all inserts.
+    """
+    old_anchors = [a for a, _ in old_chunks]
+    new_anchors = [a for a, _ in new_chunks]
+
+    sm = SequenceMatcher(None, old_anchors, new_anchors, autojunk=False)
+    aligned: List[Tuple[Optional[Tuple[str, str]], Optional[Tuple[str, str]]]] = []
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                aligned.append((old_chunks[i1 + k], new_chunks[j1 + k]))
+
+        elif tag == "delete":
+            for k in range(i1, i2):
+                aligned.append((old_chunks[k], None))
+
+        elif tag == "insert":
+            for k in range(j1, j2):
+                aligned.append((None, new_chunks[k]))
+
+        elif tag == "replace":
+            olds = old_chunks[i1:i2]
+            news = new_chunks[j1:j2]
+
+            used_new = set()
+            for o in olds:
+                best_j = None
+                best_score = 0.0
+                for idx, n in enumerate(news):
+                    if idx in used_new:
+                        continue
+                    score = SequenceMatcher(None, o[1], n[1], autojunk=False).ratio()
+                    if score > best_score:
+                        best_score = score
+                        best_j = idx
+
+                if best_j is not None and best_score >= similarity_threshold:
+                    used_new.add(best_j)
+                    aligned.append((o, news[best_j]))
+                else:
+                    aligned.append((o, None))
+
+            for idx, n in enumerate(news):
+                if idx not in used_new:
+                    aligned.append((None, n))
+
+        else:
+            raise RuntimeError(f"Unhandled opcode: {tag}")
+
+    return aligned
+
+
 # -------------------------
 # Diff rendering
 # -------------------------
 
 def dmp_inline_html(old: str, new: str, timeout_s: float = 2.0) -> str:
-    """
-    Inline semantic diff: unchanged text plain; deletions red strike; insertions blue underline.
-    """
     dmp = diff_match_patch()
     dmp.Diff_Timeout = timeout_s
-
     diffs = dmp.diff_main(old, new)
     dmp.diff_cleanupSemantic(diffs)
     dmp.diff_cleanupEfficiency(diffs)
@@ -194,13 +207,11 @@ def dmp_inline_html(old: str, new: str, timeout_s: float = 2.0) -> str:
 
 
 def nl_to_html(s: str) -> str:
-    """Convert newlines to readable HTML while preserving paragraphs."""
     return s.replace("\n\n", "</p><p>").replace("\n", "<br>")
 
-def wrap_p(inner: str) -> str:
-    """Wrap content in a paragraph block."""
-    return f"<p>{inner}</p>"
 
+def wrap_p(inner: str) -> str:
+    return f"<p>{inner}</p>"
 
 
 HTML_TEMPLATE = """<!doctype html>
@@ -230,16 +241,20 @@ HTML_TEMPLATE = """<!doctype html>
   del.del {{
     color: #b00020;
     text-decoration: line-through;
+    background: rgba(176, 0, 32, 0.12);
   }}
   ins.ins {{
     color: #0b57d0;
     text-decoration: underline;
+    background: rgba(11, 87, 208, 0.12);
   }}
   .blockdel {{
-    border-left: 3px solid #b00020; padding-left: 10px;
+    border-left: 3px solid #b00020;
+    padding-left: 10px;
   }}
   .blockins {{
-    border-left: 3px solid #0b57d0; padding-left: 10px;
+    border-left: 3px solid #0b57d0;
+    padding-left: 10px;
   }}
   .sep {{
     margin: 0.18in 0;
@@ -260,40 +275,26 @@ HTML_TEMPLATE = """<!doctype html>
 
 
 def build_redline_html(old_text: str, new_text: str, old_name: str, new_name: str, timeout_s: float = 2.0) -> str:
-    """
-    Anchor-align by heading/paragraph marker, then do inline semantic diff per chunk.
-    Unchanged text is plain; deletions are red strikethrough; insertions are blue underline.
-    """
     old_chunks = split_by_anchors(old_text)
     new_chunks = split_by_anchors(new_text)
+    pairs = align_chunks(old_chunks, new_chunks, similarity_threshold=0.35)
 
-    # Map new chunks by anchor; keep first occurrence.
-    new_map: Dict[str, str] = {}
-    for a, c in new_chunks:
-        new_map.setdefault(a, c)
-
-    used_new: Set[str] = set()
     out_parts: List[str] = []
 
-    for a_old, c_old in old_chunks:
-        c_new = new_map.get(a_old)
-        if c_new is None:
-            # Entire chunk deleted
-            deleted_html = f'<del class="del">{html.escape(c_old)}</del>'
-            out_parts.append(f'<div class="blockdel">{wrap_p(nl_to_html(deleted_html))}</div>')
-        else:
-            used_new.add(a_old)
-            merged = dmp_inline_html(c_old, c_new, timeout_s=timeout_s)
+    for old_item, new_item in pairs:
+        if old_item is not None and new_item is not None:
+            merged = dmp_inline_html(old_item[1], new_item[1], timeout_s=timeout_s)
             out_parts.append(wrap_p(nl_to_html(merged)))
 
-        out_parts.append('<div class="sep"></div>')
+        elif old_item is not None and new_item is None:
+            deleted = f'<del class="del">{html.escape(old_item[1])}</del>'
+            out_parts.append(f'<div class="blockdel">{wrap_p(nl_to_html(deleted))}</div>')
 
-    # Any chunks present only in new are inserts
-    for a_new, c_new in new_chunks:
-        if a_new not in used_new:
-            added_html = f'<ins class="ins">{html.escape(c_new)}</ins>'
-            out_parts.append(f'<div class="blockins">{wrap_p(nl_to_html(added_html))}</div>')
-            out_parts.append('<div class="sep"></div>')
+        elif old_item is None and new_item is not None:
+            added = f'<ins class="ins">{html.escape(new_item[1])}</ins>'
+            out_parts.append(f'<div class="blockins">{wrap_p(nl_to_html(added))}</div>')
+
+        out_parts.append('<div class="sep"></div>')
 
     body = "\n".join(out_parts)
     return HTML_TEMPLATE.format(
@@ -304,39 +305,23 @@ def build_redline_html(old_text: str, new_text: str, old_name: str, new_name: st
 
 
 # -------------------------
-# Optional HTML -> PDF
-# -------------------------
-
-def html_to_pdf(html_str: str, out_pdf: Path) -> None:
-    try:
-        from weasyprint import HTML  # type: ignore
-    except ImportError as e:
-        raise SystemExit("Missing dependency: weasyprint. Install with: pip install weasyprint") from e
-
-    HTML(string=html_str).write_pdf(str(out_pdf))
-
-
-# -------------------------
 # Main
 # -------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Create a redline HTML/PDF from two TXT (default) or PDF inputs.")
-    ap.add_argument("old", type=Path, help="Old version (.txt default; .pdf if --pdf or file ends with .pdf)")
-    ap.add_argument("new", type=Path, help="New version (.txt default; .pdf if --pdf or file ends with .pdf)")
-    ap.add_argument("--pdf", action="store_true", help="Force treat inputs as PDFs (extract text).")
+    ap = argparse.ArgumentParser(description="Create a redline HTML from two TXT files.")
+    ap.add_argument("old", type=Path)
+    ap.add_argument("new", type=Path)
     ap.add_argument("--out_html", type=Path, default=Path("redline.html"))
-    ap.add_argument("--out_pdf", type=Path, default=None)
     ap.add_argument("--keep_txt", action="store_true", help="Write normalized text files for inspection.")
     ap.add_argument("--timeout", type=float, default=2.0, help="Diff timeout seconds for diff-match-patch.")
     args = ap.parse_args()
 
-    old_raw = load_input(args.old, force_pdf=args.pdf)
-    new_raw = load_input(args.new, force_pdf=args.pdf)
+    old_raw = read_text_file(args.old)
+    new_raw = read_text_file(args.new)
 
-    norm_opt = NormalizeOptions()
-    old_norm = normalize_latexish_text(old_raw, norm_opt)
-    new_norm = normalize_latexish_text(new_raw, norm_opt)
+    old_norm = normalize_latexish_text(old_raw)
+    new_norm = normalize_latexish_text(new_raw)
 
     if args.keep_txt:
         args.out_html.with_suffix(".old.normalized.txt").write_text(old_norm, encoding="utf-8")
@@ -351,13 +336,7 @@ def main() -> None:
     )
 
     args.out_html.write_text(html_str, encoding="utf-8")
-
-    if args.out_pdf is not None:
-        html_to_pdf(html_str, args.out_pdf)
-
     print(f"Wrote HTML: {args.out_html}")
-    if args.out_pdf is not None:
-        print(f"Wrote PDF:  {args.out_pdf}")
 
 
 if __name__ == "__main__":
