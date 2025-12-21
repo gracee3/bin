@@ -51,6 +51,19 @@ RE_CLARK_FOOTER = re.compile(
     r"(?im)^\s*Clark\s+v\.\s+District\s+of\s+Columbia.*Complaint\s*$"
 )
 
+RE_ECF_HEADER_1LINE = re.compile(
+    r"(?im)^\s*Case\s+\S+\s+Document\s+\d+\s+Filed\s+\d{2}/\d{2}/\d{2}\s+Page\s+\d+\s+of\s+\d+\s*$"
+)
+
+# Handles the two-line split seen in 14-0.raw.txt (Document line, then Filed/Page line)
+RE_ECF_HEADER_2LINE = re.compile(
+    r"(?im)^\s*Case\s+\S+\s+Document\s+\d+\s*\n\s*Filed\s+\d{2}/\d{2}/\d{2}\s+Page\s+\d+\s+of\s+\d+\s*$"
+)
+
+# Removes odd zero-width chars that sometimes come from PDF text extraction
+RE_ZWSP = re.compile(r"[\u200b\u200c\u200d\uFEFF]")
+
+
 def normalize_latexish_text(s: str) -> str:
     """
     Normalization tuned for LaTeX-ish complaint exports:
@@ -62,6 +75,10 @@ def normalize_latexish_text(s: str) -> str:
     """
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("\r\n", "\n").replace("\r", "\n")
+
+    s = RE_ZWSP.sub("", s)
+    s = RE_ECF_HEADER_2LINE.sub("", s)
+    s = RE_ECF_HEADER_1LINE.sub("", s)
 
     # Drop page markers
     s = RE_PAGE_OF.sub("", s)
@@ -96,11 +113,15 @@ def normalize_latexish_text(s: str) -> str:
 ANCHOR_RE = re.compile(
     r"""
     (?m)
-    ^\s*[IVXLCDM]+\.\s+.+$    # Roman numeral heading like "I. INTRODUCTION"
+    ^\s*COUNT\s+[IVXLCDM]+\b.*$          # COUNT I – ...
     |
-    ^\s*\d+\.\s+              # numbered paragraph like "23. "
+    ^\s*[IVXLCDM]+\.\s+.+$               # I. INTRODUCTION
+    |
+    ^\s*\d+\.\s+                         # 23. ...
+    |
+    ^\s*[A-Z][A-Z &/\-]{3,}\s*$          # INTRODUCTION / JURISDICTION & VENUE / PROCEDURAL POSTURE
     """,
-    re.VERBOSE
+    re.VERBOSE | re.IGNORECASE
 )
 
 def split_by_anchors(text: str) -> List[Tuple[str, str]]:
