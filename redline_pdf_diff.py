@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import List, Tuple, Optional
+from diff_match_patch import diff_match_patch
+import html
 
 # -------------------------
 # PDF extraction
@@ -158,6 +160,37 @@ def normalize_text(raw: str, cfg: NormalizeConfig) -> str:
 
     return text
 
+
+def normalize_latexish_text(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove page markers like "Page 12 of 80"
+    s = re.sub(r"^\s*Page\s+\d+\s+of\s+\d+\s*$", "", s, flags=re.IGNORECASE | re.MULTILINE)
+
+    # Normalize TeX quotes to straight quotes
+    s = s.replace("``", '"').replace("''", '"')
+
+    # Normalize TeX dash conventions: treat double-dash as en-dash, triple as em-dash (or just hyphen)
+    # For diff stability, make them consistent.
+    s = s.replace("---", "—").replace("--", "–")
+
+    # Normalize section symbol variants
+    s = s.replace("§§", "§§").replace("§", "§")
+
+    # Dehyphenate words split across line breaks (TeX wraps sometimes survive)
+    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)
+
+    # Collapse trailing spaces and multiple spaces/tabs
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"[ \t]+\n", "\n", s)
+
+    # Normalize blank lines: at most one blank line
+    s = re.sub(r"\n\s*\n\s*\n+", "\n\n", s)
+
+    return s.strip()
+
+
 # -------------------------
 # Paragraph splitting and alignment
 # -------------------------
@@ -287,6 +320,32 @@ def diff_tokens_to_html(old: str, new: str) -> str:
     # Minor cleanup: collapse spaces around tags
     return "".join(parts).strip()
 
+
+def dmp_redline_html(old_text: str, new_text: str) -> str:
+    dmp = diff_match_patch()
+    dmp.Diff_Timeout = 2.0  # seconds; bump if large docs
+
+    diffs = dmp.diff_main(old_text, new_text)
+    dmp.diff_cleanupSemantic(diffs)
+    dmp.diff_cleanupEfficiency(diffs)
+
+    parts = []
+    for op, data in diffs:
+        if not data:
+            continue
+        esc = html.escape(data)
+        if op == 0:        # equal
+            parts.append(esc)
+        elif op == -1:     # delete
+            parts.append(f'<del class="del">{esc}</del>')
+        elif op == 1:      # insert
+            parts.append(f'<ins class="ins">{esc}</ins>')
+
+    # Convert newlines to paragraphs (or <br>) so it reads like a pleading
+    joined = "".join(parts)
+    joined = joined.replace("\n\n", "</p><p>").replace("\n", "<br>")
+    return f"<p>{joined}</p>"
+
 # -------------------------
 # HTML + (optional) PDF output
 # -------------------------
@@ -348,31 +407,104 @@ HTML_TEMPLATE = """<!doctype html>
 </html>
 """
 
-def build_redline_html(old_text: str, new_text: str, old_name: str, new_name: str) -> str:
-    old_paras = split_paragraphs(old_text)
-    new_paras = split_paragraphs(new_text)
+def semantic_redline_body(old_text: str, new_text: str) -> str:
+    """
+    Single-pass semantic diff over the entire document.
+    Unchanged text is plain; deletions are red strikethrough; insertions are blue underline.
+    """
+    dmp = diff_match_patch()
+    dmp.Diff_Timeout = 2.0  # seconds; increase if you have very large complaints
 
-    aligned = align_paragraphs(old_paras, new_paras)
+    diffs = dmp.diff_main(old_text, new_text)
+    dmp.diff_cleanupSemantic(diffs)
+    dmp.diff_cleanupEfficiency(diffs)
+
+    parts: List[str] = []
+    for op, data in diffs:
+        if not data:
+            continue
+        esc = html.escape(data)
+        if op == 0:        # equal
+            parts.append(esc)
+        elif op == -1:     # delete
+            parts.append(f'<del class="del">{esc}</del>')
+        elif op == 1:      # insert
+            parts.append(f'<ins class="ins">{esc}</ins>')
+
+    # Preserve readability: paragraphs and line breaks
+    joined = "".join(parts)
+    joined = joined.replace("\n\n", "</p><p>")
+    joined = joined.replace("\n", "<br>")
+
+    return f"<p>{joined}</p>"
+
+from diff_match_patch import diff_match_patch
+import html
+
+def dmp_inline(old: str, new: str) -> str:
+    dmp = diff_match_patch()
+    dmp.Diff_Timeout = 2.0
+    diffs = dmp.diff_main(old, new)
+    dmp.diff_cleanupSemantic(diffs)
+    dmp.diff_cleanupEfficiency(diffs)
+
+    out = []
+    for op, data in diffs:
+        if not data:
+            continue
+        esc = html.escape(data)
+        if op == 0:
+            out.append(esc)
+        elif op == -1:
+            out.append(f'<del class="del">{esc}</del>')
+        elif op == 1:
+            out.append(f'<ins class="ins">{esc}</ins>')
+    return "".join(out)
+
+
+def build_redline_html(old_text: str, new_text: str, old_name: str, new_name: str) -> str:
+    old_text = normalize_latexish_text(old_text)
+    new_text = normalize_latexish_text(new_text)
+
+    old_chunks = split_by_anchors(old_text)
+    new_chunks = split_by_anchors(new_text)
+
+    # Index new chunks by their anchor line for direct alignment.
+    new_map = {}
+    for a, c in new_chunks:
+        # If duplicates occur, keep the first; you can extend this to a list if needed.
+        new_map.setdefault(a, c)
 
     out_parts: List[str] = []
-    for old_p, new_p in aligned:
-        if old_p is not None and new_p is not None:
-            # Word-level diff within aligned paragraphs
-            para_html = diff_tokens_to_html(old_p, new_p)
-            if para_html:
-                out_parts.append(f"<p>{para_html}</p>")
-        elif old_p is not None and new_p is None:
-            # Entire paragraph deleted
-            out_parts.append(f'<p class="blockdel"><del class="del">{html.escape(old_p)}</del></p>')
-        elif old_p is None and new_p is not None:
-            # Entire paragraph added
-            out_parts.append(f'<p class="blockins"><ins class="ins">{html.escape(new_p)}</ins></p>')
 
-        # Optional separator between paragraphs to enhance readability
+    used_new = set()
+
+    for a_old, c_old in old_chunks:
+        c_new = new_map.get(a_old)
+        if c_new is None:
+            # Entire chunk deleted
+            out_parts.append(f'<p class="blockdel"><del class="del">{html.escape(c_old)}</del></p>')
+        else:
+            used_new.add(a_old)
+            merged = dmp_inline(c_old, c_new)
+            # Preserve paragraph breaks for readability
+            merged = merged.replace("\n\n", "</p><p>").replace("\n", "<br>")
+            out_parts.append(f"<p>{merged}</p>")
+
         out_parts.append('<div class="sep"></div>')
 
+    # Any chunks present only in new are inserts
+    for a_new, c_new in new_chunks:
+        if a_new not in used_new:
+            out_parts.append(f'<p class="blockins"><ins class="ins">{html.escape(c_new)}</ins></p>')
+            out_parts.append('<div class="sep"></div>')
+
     body = "\n".join(out_parts)
-    return HTML_TEMPLATE.format(old_name=html.escape(old_name), new_name=html.escape(new_name), body=body)
+    return HTML_TEMPLATE.format(
+        old_name=html.escape(old_name),
+        new_name=html.escape(new_name),
+        body=body,
+    )
 
 
 def html_to_pdf(html_str: str, out_pdf: Path) -> None:
@@ -382,6 +514,38 @@ def html_to_pdf(html_str: str, out_pdf: Path) -> None:
         raise SystemExit("Missing dependency: weasyprint. Install with: pip install weasyprint") from e
 
     HTML(string=html_str).write_pdf(str(out_pdf))
+
+
+from typing import List, Tuple
+
+ANCHOR_RE = re.compile(
+    r"""
+    (?m)                              # multiline
+    ^\s*[IVXLCDM]+\.\s+.+$            # Roman numeral heading like "I. INTRODUCTION"
+    |
+    ^\s*\d+\.\s+                      # numbered paragraph like "23. "
+    """,
+    re.VERBOSE
+)
+
+def split_by_anchors(text: str) -> List[Tuple[str, str]]:
+    """
+    Returns a list of (anchor, chunk_text) where anchor is the heading/paragraph marker line.
+    """
+    # Find all anchor start positions
+    matches = list(ANCHOR_RE.finditer(text))
+    if not matches:
+        return [("DOCUMENT", text)]
+
+    chunks = []
+    for idx, m in enumerate(matches):
+        start = m.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        chunk = text[start:end].strip("\n")
+        # Anchor is first line of chunk (up to newline)
+        first_line = chunk.split("\n", 1)[0].strip()
+        chunks.append((first_line, chunk))
+    return chunks
 
 # -------------------------
 # Main
